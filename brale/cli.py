@@ -591,8 +591,9 @@ Beneficiary: {wire_info.get('beneficiary_name', 'N/A')}"""
 @transfers.command('list')
 @click.option('--account', help='Account ID (uses default if not specified)')
 @click.option('--status', help='Filter by status (pending, processing, completed, failed)')
+@click.option('--show-instructions', is_flag=True, help='Show wire/ACH instructions for each transfer (makes additional API calls)')
 @click.pass_context
-def list_transfers(ctx, account, status):
+def list_transfers(ctx, account, status, show_instructions):
     """List all transfers for an account."""
     try:
         # Use provided account or default
@@ -642,7 +643,7 @@ def list_transfers(ctx, account, status):
                 return
                 
             table = Table(title=f"Transfers for Account: {account_id}")
-            table.add_column("ID", style="cyan", max_width=20)
+            table.add_column("ID", style="cyan")
             table.add_column("Status", style="green")
             table.add_column("Amount", style="yellow")
             table.add_column("From", style="blue")
@@ -650,10 +651,7 @@ def list_transfers(ctx, account, status):
             table.add_column("Created", style="dim")
             
             for transfer in transfers:
-                # Truncate long IDs for display
                 transfer_id = transfer['id']
-                if len(transfer_id) > 18:
-                    transfer_id = f"{transfer_id[:15]}..."
                 
                 amount = transfer.get('amount', {})
                 amount_str = f"${amount.get('value', 'N/A')} {amount.get('currency', '')}"
@@ -680,6 +678,64 @@ def list_transfers(ctx, account, status):
             console.print(table)
             console.print(f"\n[dim]Total: {len(transfers)} transfer(s)[/dim]")
             
+            # Show wire/ACH instructions if requested
+            if show_instructions:
+                console.print(f"\n[dim]Fetching instructions for {len(transfers)} transfer(s)...[/dim]")
+                
+                for transfer in transfers:
+                    transfer_id = transfer['id']
+                    
+                    # Fetch detailed transfer info to get instructions
+                    try:
+                        detail_response = api_client.get(f'/accounts/{account_id}/transfers/{transfer_id}')
+                        if detail_response.status_code == 200:
+                            detailed_transfer = detail_response.json()
+                            
+                            # Extract instructions
+                            wire_instructions = detailed_transfer.get('wire_instructions')
+                            ach_instructions = detailed_transfer.get('ach_instructions')
+                            
+                            if wire_instructions or ach_instructions:
+                                short_id = transfer_id[:20] + ('...' if len(transfer_id) > 20 else '')
+                                amount = transfer.get('amount', {})
+                                amount_str = f"${amount.get('value', 'N/A')} {amount.get('currency', '')}"
+                                
+                                if wire_instructions:
+                                    wire_text = f"""[bold]Wire Instructions for Transfer {short_id} ({amount_str}):[/bold]
+
+Bank Name: {wire_instructions.get('bank_name', 'N/A')}
+Bank Address: {wire_instructions.get('bank_address', 'N/A')}
+Account Number: {wire_instructions.get('account_number', 'N/A')}  
+Routing Number: {wire_instructions.get('routing_number', 'N/A')}
+Beneficiary Name: {wire_instructions.get('beneficiary_name', 'N/A')}
+Beneficiary Address: {wire_instructions.get('beneficiary_address', 'N/A')}"""
+                                    
+                                    if wire_instructions.get('memo'):
+                                        wire_text += f"\nMemo: {wire_instructions['memo']}"
+                                    
+                                    console.print(Panel(
+                                        wire_text,
+                                        border_style="blue",
+                                        title=f"Wire Instructions - {short_id}"
+                                    ))
+                                
+                                if ach_instructions:
+                                    ach_text = f"""[bold]ACH Instructions for Transfer {short_id} ({amount_str}):[/bold]
+
+Account Number: {ach_instructions.get('account_number', 'N/A')}  
+Routing Number: {ach_instructions.get('routing_number', 'N/A')}
+Account Name: {ach_instructions.get('account_name', 'N/A')}"""
+                                    
+                                    console.print(Panel(
+                                        ach_text,
+                                        border_style="green",
+                                        title=f"ACH Instructions - {short_id}"
+                                    ))
+                    
+                    except Exception as detail_error:
+                        if ctx.obj['verbose']:
+                            console.print(f"[dim yellow]Warning: Couldn't fetch instructions for {transfer_id[:20]}...: {detail_error}[/dim yellow]")
+            
     except Exception as e:
         console.print(Panel.fit(
             f"[bold red]Error[/bold red]\n{e}",
@@ -692,7 +748,7 @@ def list_transfers(ctx, account, status):
 @click.option('--account', help='Account ID (uses default if not specified)')
 @click.pass_context
 def show(ctx, transfer_id, account):
-    """Show transfer details."""
+    """Show transfer details (needs TRANSFER_ID from 'list')."""
     try:
         # Use provided account or default
         account_id = account or brale_config.get_default_account()
@@ -763,7 +819,7 @@ def show(ctx, transfer_id, account):
 @click.option('--account', help='Account ID (uses default if not specified)')
 @click.pass_context
 def instructions(ctx, transfer_id, account):
-    """Show wire/ACH instructions for a transfer."""
+    """Show wire/ACH instructions (needs TRANSFER_ID from 'list')."""
     try:
         # Use provided account or default
         account_id = account or brale_config.get_default_account()
@@ -787,6 +843,14 @@ def instructions(ctx, transfer_id, account):
                 raise click.Abort()
                 
             transfer = response.json()
+        
+        # Debug: Show full API response if verbose
+        if ctx.obj.get('verbose'):
+            console.print(Panel(
+                f"[bold cyan]DEBUG: Full API Response[/bold cyan]\n{json.dumps(transfer, indent=2)}",
+                border_style="cyan",
+                title="Debug Info"
+            ))
         
         output_format = ctx.obj['output']
         
@@ -974,18 +1038,22 @@ def create(ctx, name, token, network, account):
             title="Success"
         ))
         
-        # Show wire instructions if available
+        # Show wire instructions if available - always show for table output
         if 'wire_instructions' in result:
             wire_info = result['wire_instructions']
             instructions_text = f"""[bold]Customer Wire Instructions:[/bold]
 
 Bank Name: {wire_info.get('bank_name', 'N/A')}
+Bank Address: {wire_info.get('bank_address', 'N/A')}
 Account Number: {wire_info.get('account_number', 'N/A')}  
 Routing Number: {wire_info.get('routing_number', 'N/A')}
-Beneficiary: {wire_info.get('beneficiary_name', 'N/A')}
-Memo: {wire_info.get('memo') or 'None'}
-
-[dim]Share these instructions with customers to automatically mint {token.upper()} to your wallet.[/dim]"""
+Beneficiary Name: {wire_info.get('beneficiary_name', 'N/A')}
+Beneficiary Address: {wire_info.get('beneficiary_address', 'N/A')}"""
+            
+            if wire_info.get('memo'):
+                instructions_text += f"\nMemo: {wire_info['memo']}"
+            
+            instructions_text += f"\n\n[dim]Share these instructions with customers to automatically mint {token.upper()} to your wallet.[/dim]"
             
             console.print(Panel(
                 instructions_text,
@@ -1062,22 +1130,16 @@ def list_automations(ctx, account, status):
                 return
                 
             table = Table(title=f"Automations for Account: {account_id}")
-            table.add_column("ID", style="cyan", max_width=20)
-            table.add_column("Name", style="blue", max_width=25)
+            table.add_column("ID", style="cyan")
+            table.add_column("Name", style="blue")
             table.add_column("Status", style="green")
             table.add_column("Token", style="yellow")
             table.add_column("Network", style="magenta")
             table.add_column("Created", style="dim")
             
             for automation in automations:
-                # Truncate long IDs and names for display
                 auto_id = automation['id']
-                if len(auto_id) > 18:
-                    auto_id = f"{auto_id[:15]}..."
-                
                 name = automation.get('name', 'N/A')
-                if len(name) > 22:
-                    name = f"{name[:19]}..."
                 
                 dest = automation.get('destination', {})
                 token = dest.get('value_type', 'N/A')
@@ -1099,6 +1161,34 @@ def list_automations(ctx, account, status):
             console.print(table)
             console.print(f"\n[dim]Total: {len(automations)} automation(s)[/dim]")
             
+            # Show wire instructions for each automation that has them
+            for automation in automations:
+                wire_instructions = automation.get('wire_instructions')
+                if wire_instructions:
+                    auto_id = automation['id'][:20] + ('...' if len(automation['id']) > 20 else '')
+                    name = automation.get('name', 'N/A')
+                    dest = automation.get('destination', {})
+                    token = dest.get('value_type', 'N/A')
+                    network = dest.get('transfer_type', 'N/A')
+                    
+                    instructions_text = f"""[bold]Wire Instructions for "{name}" ({token} on {network}):[/bold]
+
+Bank Name: {wire_instructions.get('bank_name', 'N/A')}
+Bank Address: {wire_instructions.get('bank_address', 'N/A')}
+Account Number: {wire_instructions.get('account_number', 'N/A')}  
+Routing Number: {wire_instructions.get('routing_number', 'N/A')}
+Beneficiary Name: {wire_instructions.get('beneficiary_name', 'N/A')}
+Beneficiary Address: {wire_instructions.get('beneficiary_address', 'N/A')}"""
+                    
+                    if wire_instructions.get('memo'):
+                        instructions_text += f"\nMemo: {wire_instructions['memo']}"
+                    
+                    console.print(Panel(
+                        instructions_text,
+                        border_style="yellow",
+                        title=f"Customer Instructions - {auto_id}"
+                    ))
+            
     except Exception as e:
         console.print(Panel.fit(
             f"[bold red]Error[/bold red]\n{e}",
@@ -1111,7 +1201,7 @@ def list_automations(ctx, account, status):
 @click.option('--account', help='Account ID (uses default if not specified)')
 @click.pass_context
 def show(ctx, automation_id, account):
-    """Show automation details."""
+    """Show automation details (needs AUTOMATION_ID from 'list')."""
     try:
         # Use provided account or default
         account_id = account or brale_config.get_default_account()
@@ -1177,7 +1267,7 @@ def show(ctx, automation_id, account):
 @click.option('--account', help='Account ID (uses default if not specified)')
 @click.pass_context
 def instructions(ctx, automation_id, account):
-    """Show customer wire instructions for an automation."""
+    """Show wire instructions for automation (needs AUTOMATION_ID from 'list')."""
     try:
         # Use provided account or default
         account_id = account or brale_config.get_default_account()
